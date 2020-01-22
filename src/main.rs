@@ -7,7 +7,6 @@ use uuid::Uuid;
 use serde::Serialize;
 use serde_json::Value;
 
-static mut MAP: &str = ""; //TODO ?????????????????
 const VERSION: &str = "0.0.3";
 
 struct Connections {
@@ -118,7 +117,7 @@ impl Player {
 }
 
 fn main() {
-
+    let map = Arc::new(RwLock::new(String::new()));
     let connections = Arc::new(RwLock::new(Connections::new()));
 
     //FOR DEBUGGING PURPOSES
@@ -163,9 +162,15 @@ fn main() {
                     Ok(stream) => {
                         println!("Got connection!");
                         let cons = connections.clone();
-                        thread::spawn(move || {
-                            handle(cons, stream);
-                        });
+                        let connections = connections.read().unwrap();
+                        if connections.len() < 8 {
+                            let map_cl = map.clone();
+                            thread::spawn(move || {
+                                handle(cons, stream, map_cl);
+                            });
+                        } else {
+                            println!("Denied: Server full (max 8 players)");
+                        }
                     }
                     Err(_) => {
                         println!("Something went wrong while accepting incoming request!");
@@ -178,12 +183,12 @@ fn main() {
         }
     }
 }
-fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream) {
+fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwLock<String>>) {
     //let addr = stream.local_addr().unwrap();      //TEST
     let (mut reader, writer) = stream.try_clone().map(|clone| {(BufReader::new(stream), BufWriter::new(clone))}).unwrap();
     let id = Uuid::new_v4().to_string();
 
-    let mut player = match handshake(writer, &mut reader, &connections, id) {
+    let mut player = match handshake(writer, &mut reader, &connections, id, &map) {
         Ok(player) => {
             println!("Handshake successful");
             player
@@ -196,10 +201,13 @@ fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream) {
 
     loop {
         let mut s = String::new();
+        let mut online = true;
         if reader.read_line(&mut s).unwrap()>0 {
-            handle_client_msg(s, &connections, &mut player);
+            online = handle_client_msg(s, &connections, &mut player, &map);
+            if !online {break;}
         } else {
             on_close(&connections, &mut player);
+            break;
         }
     }
 
@@ -228,15 +236,12 @@ fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream) {
     //END OF TESTING CODE
 }
 
-fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<TcpStream>, connections: &'a Arc<RwLock<Connections>>, id: String) -> Result<Player, &'a str> {
+fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<TcpStream>, connections: &'a Arc<RwLock<Connections>>, id: String, map: &Arc<RwLock<String>>) -> Result<Player, &'a str> {
     writer.write(format!("HOLA{}", id).as_bytes()).unwrap();
-
-    unsafe {
-        if MAP == "" {
-            writer.write(b"MAPS").unwrap();
-        } else {
-            writer.write(format!("MAPC{}", MAP).as_bytes()).unwrap();
-        }
+    if *map.read().unwrap() == "" {
+        writer.write(b"MAPS").unwrap();
+    } else {
+        writer.write(format!("MAPC{}", *map.read().unwrap()).as_bytes()).unwrap();
     }
     writer.write(format!("VCHK{}", VERSION).as_bytes()).unwrap();
     writer.flush().unwrap();
@@ -284,25 +289,17 @@ fn update_players_list_and_send<'a>(player: &Player, connections: &'a Arc<RwLock
     if op {connections.add_player(Player::copy(player), writer.unwrap());}
     else {connections.remove_player(player);}
     let list = connections.get_list_of_players();
-    let list = serde_json::to_string(&list);
-    let list = match list {
-        Ok(list) => {
-            list
-        }
-        Err(_) => {
-            return Err("Error parsing json list");
-        }
-    };
+    let list = serde_json::to_string(&list).expect("Error parsing json list");
     connections.broadcast(format!("PLST{}", list));
     Ok(())
 }
 
-fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player: &mut Player) {
+fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player: &mut Player, map: &Arc<RwLock<String>>) -> bool {
     let msg = msg.trim();
     let code = &msg[..4];
     let msg = msg[4..].to_string();
 
-    if code == "QUIT" || code == "2001" {on_close(connections, player)}
+    if code == "QUIT" || code == "2001" {on_close(connections, player); return false;}
 
     let mut connections = connections.write().unwrap();
     match code {
@@ -313,9 +310,8 @@ fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player
             connections.broadcast(msg);
         }
         "MAPS" => {
-            unsafe {
-                //TODO ???????????????????
-            }
+            let mut map = map.write().unwrap();
+            *map = msg;
         }
         "U-VI" | "U-VE" | "U-VN" | "U-VP" | "U-VL" | "U-VR" => {
             connections.broadcast_to_everyone_else(msg, player);
@@ -334,9 +330,13 @@ fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player
             }
         }
         _ => {
-
+            println!("Unknown request from {}:{} (nickname: {}):\n{}", player.remote_address,
+                                                        player.remote_port,
+                                                        player.nickname,
+                                                        msg);
         }
     }
+    true
 }
 
 fn on_close(connections: &Arc<RwLock<Connections>>, player: &mut Player) {
