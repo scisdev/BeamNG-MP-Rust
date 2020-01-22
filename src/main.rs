@@ -29,20 +29,22 @@ impl Connections {
         Connections { map: HashMap::new()}
     }
 
-    pub fn broadcast(&mut self, msg: String) {
+    pub fn broadcast(&mut self, msg: String) -> Result<(), &str> {
         for socket in &mut self.map {
-            socket.1.write(msg.as_bytes()).unwrap();
+            socket.1.write(msg.as_bytes()).expect("Error broadcasting");
             socket.1.flush().unwrap();
         }
+        Ok(())
     }
 
-    pub fn broadcast_to_everyone_else(&mut self, msg: String, except: &Player) {
+    pub fn broadcast_to_everyone_else(&mut self, msg: String, except: &Player) -> Result<(), &str> {
         for socket in &mut self.map {
             if !Player::eq(socket.0, except) {
-                socket.1.write(msg.as_bytes()).unwrap();
+                socket.1.write(msg.as_bytes()).expect("Error broadcasting");
                 socket.1.flush().unwrap();
             }
         }
+        Ok(())
     }
 
     pub fn add_player(&mut self, player: Player, writer: BufWriter<TcpStream>) {
@@ -66,23 +68,9 @@ impl Connections {
     }
 
     pub fn send_private(&mut self, msg: String, to: &Player) -> Result<(), &str> {
-        let stream = &mut self.map.get_mut(to);
-        let stream = match stream {
-            Some(stream) => {
-                stream
-            }
-            None => {
-                return Err("No such player found in player list");
-            }
-        };
-        match stream.write(msg.as_bytes()) {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(_) => {
-                Err("Error while writing to stream")
-            }
-        }
+        let stream = &mut self.map.get_mut(to).expect("No such player found in player list");
+        stream.write(msg.as_bytes()).expect("Error writing to stream");
+        Ok(())
     }
 }
 
@@ -201,7 +189,7 @@ fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwL
 
     loop {
         let mut s = String::new();
-        let mut online = true;
+        let online;
         if reader.read_line(&mut s).unwrap()>0 {
             online = handle_client_msg(s, &connections, &mut player, &map);
             if !online {break;}
@@ -219,9 +207,7 @@ fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwL
                              format!("{}", count), id,
                              "0".to_string()));
     let cl = connections.clone();
-    println!("Done 2");
     test(cl, player, writer);
-    println!("Tested");
     loop {
         let mut s = String::new();
         if reader.read_line(&mut s).unwrap()>0 {
@@ -259,8 +245,9 @@ fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<Tcp
         Ok(_) => {
             Ok(player)
         }
-        Err(_) => {
-            Err("Could not update players list for some reason")
+        Err(msg) => {
+            println!("{}", msg);
+            Err("Could not update players list for some reason. Msg why is above")
         }
     }
 }
@@ -277,7 +264,7 @@ fn get_player(reader: &mut BufReader<TcpStream>, id: String) -> Result<Player, &
                                     addr.port(),
                                      json["nickname"].as_str().unwrap().to_string(),
                                     id,
-                                    "0".to_string()));
+                                    String::from("0")));
         }
         count +=1;
     }
@@ -290,7 +277,10 @@ fn update_players_list_and_send<'a>(player: &Player, connections: &'a Arc<RwLock
     else {connections.remove_player(player);}
     let list = connections.get_list_of_players();
     let list = serde_json::to_string(&list).expect("Error parsing json list");
-    connections.broadcast(format!("PLST{}", list));
+    match connections.broadcast(format!("PLST{}", list)) {
+        Ok(_) => {}
+        Err(msg) => {println!("{}", msg); return Err("Error sending PLST: {}");}
+    }
     Ok(())
 }
 
@@ -304,20 +294,34 @@ fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player
     let mut connections = connections.write().unwrap();
     match code {
         "PING" => {
-            connections.send_private("PONG".to_string(), player);
+            match connections.send_private(String::from("PONG"), player) {
+                Ok(()) => {}
+                Err(msg) => {
+                    println!("Error Pinging: {}", msg);
+                }
+            }
         }
         "CHAT" => {
-            connections.broadcast(msg);
+            match connections.broadcast(msg) {
+                Ok(_) => {}
+                Err(msg) => {println!("CHAT: {}", msg);}
+            }
         }
         "MAPS" => {
             let mut map = map.write().unwrap();
             *map = msg;
         }
         "U-VI" | "U-VE" | "U-VN" | "U-VP" | "U-VL" | "U-VR" => {
-            connections.broadcast_to_everyone_else(msg, player);
+            match connections.broadcast_to_everyone_else(msg, player) {
+                Ok(_) => {}
+                Err(msg) => {println!("U-VI: {}", msg);}
+            }
         }
         "U-VC" => {
-            connections.broadcast(msg);
+            match connections.broadcast(msg) {
+                Ok(_) => {}
+                Err(msg) => {println!("U-VC: {}", msg);}
+            }
         }
         "U-NV" => {
             println!("U-NV:\n{}", msg);
@@ -341,5 +345,10 @@ fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player
 
 fn on_close(connections: &Arc<RwLock<Connections>>, player: &mut Player) {
     println!("Player {} disconnected", player.nickname);
-    update_players_list_and_send(player, connections, Option::None, false);
+    match update_players_list_and_send(player, connections, Option::None, false) {
+        Ok(()) => {}
+        Err(msg) => {
+            println!("Error closing: {}", msg);
+        }
+    }
 }
