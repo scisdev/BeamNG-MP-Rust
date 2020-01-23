@@ -1,4 +1,4 @@
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket, SocketAddr};
 use std::thread;
 use std::io::{Write, BufReader, BufRead, BufWriter};
 use std::sync::{Arc, RwLock};
@@ -47,6 +47,13 @@ impl Connections {
         Ok(())
     }
 
+    pub fn send_private(&mut self, msg: String, to: &Player) -> Result<(), &str> {
+        let stream = &mut self.map.get_mut(to).expect("No such player found in player list");
+        stream.write(msg.as_bytes()).expect("Error writing to stream");
+        stream.flush().unwrap();
+        Ok(())
+    }
+
     pub fn add_player(&mut self, player: Player, writer: BufWriter<TcpStream>) {
         self.map.insert(player, writer);
     }
@@ -63,14 +70,16 @@ impl Connections {
         res
     }
 
-    pub fn len(&self) -> usize {
-        self.map.len()
+    pub fn get_addresses(&self) -> Vec<SocketAddr> {
+        let mut res: Vec<SocketAddr> = vec![];
+        for player in &self.map {
+            res.push(player.1.get_ref().local_addr().unwrap());
+        }
+        res
     }
 
-    pub fn send_private(&mut self, msg: String, to: &Player) -> Result<(), &str> {
-        let stream = &mut self.map.get_mut(to).expect("No such player found in player list");
-        stream.write(msg.as_bytes()).expect("Error writing to stream");
-        Ok(())
+    pub fn len(&self) -> usize {
+        self.map.len()
     }
 }
 
@@ -105,26 +114,15 @@ impl Player {
 }
 
 fn main() {
+
     let map = Arc::new(RwLock::new(String::new()));
     let connections = Arc::new(RwLock::new(Connections::new()));
-
-    //FOR DEBUGGING PURPOSES
-    /*print!("Enter IP address to open TCP on (leave empty for localhost): ");
-    std::io::stdout().flush().unwrap();
-    let tcp_ip = {
-        let mut tcp_ip = String::new();
-        if std::io::stdin().read_line( &mut tcp_ip).unwrap()==1 {
-            String::from("localhost")
-        } else {
-            tcp_ip
-        }
-    };
 
     print!("Enter port number to open TCP on (leave empty for 30813): ");
     std::io::stdout().flush().unwrap();
     let tcp_port = {
         let mut tcp_port = String::new();
-        if std::io::stdin().read_line(&mut tcp_port).unwrap()==1 {
+        if std::io::stdin().read_line(&mut tcp_port).unwrap()<=2 {
             30813u16
         } else {
             match tcp_port.trim().parse::<u16>() {
@@ -137,46 +135,56 @@ fn main() {
                 }
             }
         }
-    };*/
-    //FOR DEBUGGING PURPOSES
+    };
 
-    //match TcpListener::bind(format!("{}:{}", tcp_ip, tcp_port)) { THIS IS DEBUG
-    match TcpListener::bind("localhost:30813") {
+    match TcpListener::bind(format!("0.0.0.0:{}", tcp_port)) {
         Ok(listener) => {
-            //println!("Listening on {}:{}", tcp_ip, tcp_port); THIS IS DEBUG
-            println!("Listening on localhost:30813");
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        println!("Got connection!");
-                        let cons = connections.clone();
-                        let connections = connections.read().unwrap();
-                        if connections.len() < 8 {
-                            let map_cl = map.clone();
-                            thread::spawn(move || {
-                                handle(cons, stream, map_cl);
-                            });
-                        } else {
-                            println!("Denied: Server full (max 8 players)");
+            println!("TCP listening on {}", format!("0.0.0.0:{}", tcp_port));
+            let tcp_cons = connections.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    match stream {
+                        Ok(stream) => {
+                            println!("Got connection!");
+                            let cons = tcp_cons.clone();
+                            let size_lock = tcp_cons.read().unwrap();
+                            if size_lock.len() < 8 {
+                                let map_cl = map.clone();
+                                thread::spawn(move || {
+                                    handle(cons, stream, map_cl);
+                                });
+                            } else {
+                                println!("Denied: Server full (max 8 players)");
+                            }
+                        }
+                        Err(_) => {
+                            println!("Something went wrong while accepting incoming request!");
                         }
                     }
-                    Err(_) => {
-                        println!("Something went wrong while accepting incoming request!");
-                    }
                 }
-            }
+            });
         }
         Err(_) => {
             //println!("Could not open server on {}:{}", tcp_ip, tcp_port); THIS IS DEBUG
         }
+    };
+
+    match UdpSocket::bind(format!("0.0.0.0:{}", tcp_port+1)) {
+        Ok(udp) => {
+            println!("UDP listening on {}", format!("0.0.0.0:{}", tcp_port+1));
+            udp_loop(udp, connections.clone());
+        }
+        Err(_) => {
+            println!("Could not bind UDP to {}", tcp_port+1);
+        }
     }
 }
+
 fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwLock<String>>) {
-    //let addr = stream.local_addr().unwrap();      //TEST
     let (mut reader, writer) = stream.try_clone().map(|clone| {(BufReader::new(stream), BufWriter::new(clone))}).unwrap();
     let id = Uuid::new_v4().to_string();
 
-    let mut player = match handshake(writer, &mut reader, &connections, id, &map) {
+    let player = match handshake(writer, &mut reader, &connections, id, &map) {
         Ok(player) => {
             println!("Handshake successful");
             player
@@ -187,49 +195,24 @@ fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwL
         }
     };
 
-    loop {
-        let mut s = String::new();
-        let online;
-        if reader.read_line(&mut s).unwrap()>0 {
-            online = handle_client_msg(s, &connections, &mut player, &map);
-            if !online {break;}
-        } else {
-            on_close(&connections, &mut player);
-            break;
+    match main_loop(reader, connections, player, map) {
+        Ok(()) => {
+            println!("Client successfully served");
         }
-    }
-
-    //IF WE WANT TO TEST MORE CODE BELOW IS FOR THAT
-
-    /*let name = format!("{}", count);
-    let player = Arc::new(Player::new(addr.ip().to_string(),
-                                      addr.port(),
-                             format!("{}", count), id,
-                             "0".to_string()));
-    let cl = connections.clone();
-    test(cl, player, writer);
-    loop {
-        let mut s = String::new();
-        if reader.read_line(&mut s).unwrap()>0 {
-            connections.write().unwrap().broadcast(format!("{}:{}", &name, s));
+        Err(msg) => {
+            println!("Error occurred after handshake:\n{}", msg);
         }
-        else {
-            println!("{} disconnected", name);
-            break;
-        }
-    }*/
-
-    //END OF TESTING CODE
+    };
 }
 
 fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<TcpStream>, connections: &'a Arc<RwLock<Connections>>, id: String, map: &Arc<RwLock<String>>) -> Result<Player, &'a str> {
-    writer.write(format!("HOLA{}", id).as_bytes()).unwrap();
+    writer.write(format!("HOLA{}\n", id).as_bytes()).unwrap();
     if *map.read().unwrap() == "" {
-        writer.write(b"MAPS").unwrap();
+        writer.write(b"MAPS\n").unwrap();
     } else {
-        writer.write(format!("MAPC{}", *map.read().unwrap()).as_bytes()).unwrap();
+        writer.write(format!("MAPC{}\n", *map.read().unwrap()).as_bytes()).unwrap();
     }
-    writer.write(format!("VCHK{}", VERSION).as_bytes()).unwrap();
+    writer.write(format!("VCHK{}\n", VERSION).as_bytes()).unwrap();
     writer.flush().unwrap();
 
     let player = match get_player(reader, id) {
@@ -256,30 +239,68 @@ fn get_player(reader: &mut BufReader<TcpStream>, id: String) -> Result<Player, &
     let mut count = 0u8;
     while count < 10 {
         let mut s = String::new();
-        if reader.read_line(&mut s).unwrap()==0 {return Err("Client disconnected during handshake");}
-        if &s[..4]=="USER" {
-            let json = serde_json::from_str::<Value>(&s[4..]).unwrap();
-            let addr = reader.get_mut().local_addr().unwrap();
-            return Ok(Player::new(addr.ip().to_string(),
-                                    addr.port(),
-                                     json["nickname"].as_str().unwrap().to_string(),
-                                    id,
-                                    String::from("0")));
+        match reader.read_line(&mut s) {
+            Ok(size) if size > 4 => {
+                if &s[..4]=="USER" {
+                    let addr = reader.get_mut().local_addr().unwrap();
+                    return Ok(Player::new(addr.ip().to_string(),
+                                          addr.port(),
+                                          s[4..].trim().to_string(),
+                                          id,
+                                          String::from("0")));
+                }
+                count +=1;
+            }
+            _ => {return Err("Client disconnected during handshake");}
         }
-        count +=1;
     }
     Err("Client did not give information about themselves (\"USER\" code was not received)")
 }
 
-fn update_players_list_and_send<'a>(player: &Player, connections: &'a Arc<RwLock<Connections>>, writer: Option<BufWriter<TcpStream>>, op: bool) -> Result<(), &'a str> {
+fn update_players_list_and_send<'a>(player: &Player, connections: &'a Arc<RwLock<Connections>>, writer: Option<BufWriter<TcpStream>>, op: bool) -> Result<usize, &'a str> {
     let mut connections = connections.write().unwrap();
     if op {connections.add_player(Player::copy(player), writer.unwrap());}
     else {connections.remove_player(player);}
     let list = connections.get_list_of_players();
     let list = serde_json::to_string(&list).expect("Error parsing json list");
-    match connections.broadcast(format!("PLST{}", list)) {
+    match connections.broadcast(format!("PLST{}\n", list)) {
         Ok(_) => {}
-        Err(msg) => {println!("{}", msg); return Err("Error sending PLST: {}");}
+        Err(msg) => {println!("{}", msg); return Err("Error sending PLST");}
+    };
+    Ok(connections.len())
+}
+
+fn main_loop<'a>(mut reader: BufReader<TcpStream>, connections: Arc<RwLock<Connections>>, mut player: Player, map: Arc<RwLock<String>>) -> Result<(), &'a str> {
+    let mut online = false;
+    loop {
+        let mut s = String::new();
+        let check = match reader.read_line(&mut s) {
+            Ok(size) => {
+                println!("TCP: {}", &s);
+                if size > 3 {
+                    online = handle_client_msg(s, &connections, &mut player, &map);
+                } else {
+                    on_close(&connections, &mut player, &map);
+                    online = false;
+                }
+                Ok(())
+            }
+            Err(_) => {
+                on_close(&connections, &mut player, &map);
+                Err("Error in main loop. Client unexpectedly disconnected.")
+            }
+        };
+        match check {
+            Ok(()) => {
+                if online {
+                    continue;
+                }
+                else {break;}
+            }
+            Err(msg) => {
+                return Err(msg);
+            }
+        }
     }
     Ok(())
 }
@@ -289,38 +310,40 @@ fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player
     let code = &msg[..4];
     let msg = msg[4..].to_string();
 
-    if code == "QUIT" || code == "2001" {on_close(connections, player); return false;}
+    if code == "QUIT" || code == "2001" {on_close(connections, player, map); return false;}
 
     let mut connections = connections.write().unwrap();
     match code {
         "PING" => {
-            match connections.send_private(String::from("PONG"), player) {
+            match connections.send_private(String::from("PONG\n"), player) {
                 Ok(()) => {}
-                Err(msg) => {
-                    println!("Error Pinging: {}", msg);
-                }
+                Err(msg) => { println!("Error sending (PONG) via TCP: {}", msg); }
             }
         }
         "CHAT" => {
-            match connections.broadcast(msg) {
-                Ok(_) => {}
-                Err(msg) => {println!("CHAT: {}", msg);}
+            match connections.broadcast(format!("CHAT{}\n", msg)) {
+                Ok(_) => {println!("Broadcasting CHAT: {}", msg);}
+                Err(msg) => {println!("Error sending (CHAT) via TCP: {}", msg);}
             }
         }
         "MAPS" => {
             let mut map = map.write().unwrap();
             *map = msg;
+            match connections.send_private(format!("MAPC{}\n", *map), player) {
+                Ok(()) => {}
+                Err(msg) => {println!("Error sending (MAPC) via TCP: {}", msg);}
+            }
         }
         "U-VI" | "U-VE" | "U-VN" | "U-VP" | "U-VL" | "U-VR" => {
-            match connections.broadcast_to_everyone_else(msg, player) {
+            match connections.broadcast_to_everyone_else(format!("{}\n", msg), player) {
                 Ok(_) => {}
-                Err(msg) => {println!("U-VI: {}", msg);}
+                Err(msg) => {println!("Error sending (U-V[I/E/N/P/L/R]) via TCP: {}", msg);}
             }
         }
         "U-VC" => {
-            match connections.broadcast(msg) {
+            match connections.broadcast(format!("{}\n", msg)) {
                 Ok(_) => {}
-                Err(msg) => {println!("U-VC: {}", msg);}
+                Err(msg) => {println!("Error sending (U-VC) via TCP: {}", msg);}
             }
         }
         "U-NV" => {
@@ -343,12 +366,75 @@ fn handle_client_msg(msg: String, connections: &Arc<RwLock<Connections>>, player
     true
 }
 
-fn on_close(connections: &Arc<RwLock<Connections>>, player: &mut Player) {
+fn on_close(connections: &Arc<RwLock<Connections>>, player: &mut Player, map: &Arc<RwLock<String>>) {
     println!("Player {} disconnected", player.nickname);
     match update_players_list_and_send(player, connections, Option::None, false) {
-        Ok(()) => {}
+        Ok(remaining) => {
+            if remaining==0 {
+                let mut map = map.write().unwrap();
+                *map = String::from("");
+            }
+        }
         Err(msg) => {
             println!("Error closing: {}", msg);
+        }
+    }
+}
+
+fn udp_loop(mut udp: UdpSocket, connections: Arc<RwLock<Connections>>) {
+    loop {
+        let mut s = [0u8; 2048];
+        match udp.recv_from(&mut s) {
+            Ok(tuple) if tuple.0 > 3 => {
+                let s = match std::str::from_utf8(&s) {
+                    Ok(string) => {
+                        string
+                    }
+                    Err(_) => {
+                        println!("Non-UTF-8 was received.");
+                        continue;
+                    }
+                };
+                println!("Size of received UDP is {}", tuple.0);
+                handle_udp_request(s, tuple.1, &mut udp, &connections);
+            }
+            _ => {
+                println!("Error receiving from UDP");
+            }
+        };
+    }
+}
+
+fn handle_udp_request(string: &str, addr: SocketAddr, udp: &mut UdpSocket, connections: &Arc<RwLock<Connections>>) {
+    let code = &string[..4];
+    let msg = &string[4..];
+    match code {
+        "PING" => {
+            match udp.send_to(b"PONG\n", addr) {
+                Ok(_) => {}
+                Err(_) => { println!("Error sending (PONG) via UDP"); }
+            }
+        }
+        "U-VI" | "U-VE" | "U-VN" | "U-VP" | "U-VL" | "U-VR" => {
+            let local = udp.local_addr().unwrap();
+            let addr = connections.read().unwrap().get_addresses();
+            for unit in addr {
+                if unit != local {
+                    match udp.send_to(msg.as_bytes(), unit) {
+                        Ok(_) => {}
+                        Err(_) => { println!("Error sending (U-V[I/E/N/P/L/R]) via UDP"); }
+                    }
+                }
+            }
+        }
+        "U-VC" | _ => {
+            let addr = connections.read().unwrap().get_addresses();
+            for unit in addr {
+                match udp.send_to(msg.as_bytes(), unit) {
+                    Ok(_) => {}
+                    Err(_) => { println!("Error sending (U-VC or unhandled) via UDP"); }
+                }
+            }
         }
     }
 }
