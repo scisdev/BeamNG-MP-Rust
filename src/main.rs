@@ -5,7 +5,6 @@ use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use uuid::Uuid;
 use serde::Serialize;
-use serde_json::Value;
 
 const VERSION: &str = "0.0.3";
 
@@ -115,6 +114,7 @@ impl Player {
 
 fn main() {
 
+    let env = "{\"azimuthOverride\" = 0,\"nightScale\" = 1.5, \"time\" = 0, \"dayLength\" = 120, \"dayScale\" = 1, \"play\" = false}/0/-9.81/0";
     let map = Arc::new(RwLock::new(String::new()));
     let connections = Arc::new(RwLock::new(Connections::new()));
 
@@ -139,7 +139,7 @@ fn main() {
 
     match TcpListener::bind(format!("0.0.0.0:{}", tcp_port)) {
         Ok(listener) => {
-            println!("TCP listening on {}", format!("0.0.0.0:{}", tcp_port));
+            println!("\nTCP listening on {}", format!("0.0.0.0:{}", tcp_port));
             let tcp_cons = connections.clone();
             thread::spawn(move || {
                 for stream in listener.incoming() {
@@ -151,7 +151,7 @@ fn main() {
                             if size_lock.len() < 8 {
                                 let map_cl = map.clone();
                                 thread::spawn(move || {
-                                    handle(cons, stream, map_cl);
+                                    handle(cons, stream, map_cl, env);
                                 });
                             } else {
                                 println!("Denied: Server full (max 8 players)");
@@ -180,11 +180,11 @@ fn main() {
     }
 }
 
-fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwLock<String>>) {
+fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwLock<String>>, env: &str) {
     let (mut reader, writer) = stream.try_clone().map(|clone| {(BufReader::new(stream), BufWriter::new(clone))}).unwrap();
     let id = Uuid::new_v4().to_string();
 
-    let player = match handshake(writer, &mut reader, &connections, id, &map) {
+    let player = match handshake(writer, &mut reader, &connections, id, &map, env) {
         Ok(player) => {
             println!("Handshake successful");
             player
@@ -205,7 +205,7 @@ fn handle(connections: Arc<RwLock<Connections>>, stream: TcpStream, map: Arc<RwL
     };
 }
 
-fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<TcpStream>, connections: &'a Arc<RwLock<Connections>>, id: String, map: &Arc<RwLock<String>>) -> Result<Player, &'a str> {
+fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<TcpStream>, connections: &'a Arc<RwLock<Connections>>, id: String, map: &Arc<RwLock<String>>, env: &str) -> Result<Player, &'a str> {
     writer.write(format!("HOLA{}\n", id).as_bytes()).unwrap();
     if *map.read().unwrap() == "" {
         writer.write(b"MAPS\n").unwrap();
@@ -224,6 +224,11 @@ fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<Tcp
         }
     };
 
+    match sync_env(&mut writer, env) {
+        Ok(_) => {}
+        Err(msg) => {return Err("Error syncing environment");}
+    }
+
     match update_players_list_and_send(&player, connections, Option::Some(writer), true) {
         Ok(_) => {
             Ok(player)
@@ -235,7 +240,7 @@ fn handshake<'a>(mut writer: BufWriter<TcpStream>, reader: &'a mut BufReader<Tcp
     }
 }
 
-fn get_player(reader: &mut BufReader<TcpStream>, id: String) -> Result<Player, &str> {
+fn get_player(reader: & mut BufReader<TcpStream>, id: String) -> Result<Player, &str> {
     let mut count = 0u8;
     while count < 10 {
         let mut s = String::new();
@@ -257,6 +262,14 @@ fn get_player(reader: &mut BufReader<TcpStream>, id: String) -> Result<Player, &
     Err("Client did not give information about themselves (\"USER\" code was not received)")
 }
 
+fn sync_env<'a>(writer: &'a mut BufWriter<TcpStream>, env: &str) -> Result<(), &'a str> {
+    match writer.write(format!("ENVT{}\n", env).as_bytes()) {
+        Ok(_) => {}
+        Err(_) => {return Err("Error sending environment");}
+    }
+    Ok(())
+}
+
 fn update_players_list_and_send<'a>(player: &Player, connections: &'a Arc<RwLock<Connections>>, writer: Option<BufWriter<TcpStream>>, op: bool) -> Result<usize, &'a str> {
     let mut connections = connections.write().unwrap();
     if op {connections.add_player(Player::copy(player), writer.unwrap());}
@@ -272,11 +285,17 @@ fn update_players_list_and_send<'a>(player: &Player, connections: &'a Arc<RwLock
 
 fn main_loop<'a>(mut reader: BufReader<TcpStream>, connections: Arc<RwLock<Connections>>, mut player: Player, map: Arc<RwLock<String>>) -> Result<(), &'a str> {
     let mut online = false;
+    let mut count = 0u64;
+    let mut acc = 0u64;
     loop {
         let mut s = String::new();
         let check = match reader.read_line(&mut s) {
             Ok(size) => {
-                println!("TCP: {}", &s);
+                if size > 100 {
+                    count += 1;
+                    acc += size as u64;
+                    if count == 100 {println!("TCP: average (over 100 reads longer than 100 bytes) is {} bytes", acc/count); count = 0;}
+                }
                 if size > 3 {
                     online = handle_client_msg(s, &connections, &mut player, &map);
                 } else {
@@ -382,6 +401,8 @@ fn on_close(connections: &Arc<RwLock<Connections>>, player: &mut Player, map: &A
 }
 
 fn udp_loop(mut udp: UdpSocket, connections: Arc<RwLock<Connections>>) {
+    let mut count = 0u64;
+    let mut acc = 0u64;
     loop {
         let mut s = [0u8; 2048];
         match udp.recv_from(&mut s) {
@@ -395,7 +416,12 @@ fn udp_loop(mut udp: UdpSocket, connections: Arc<RwLock<Connections>>) {
                         continue;
                     }
                 };
-                println!("Size of received UDP is {}", tuple.0);
+                if tuple.0 > 100 {
+                    count += 1;
+                    acc += tuple.0 as u64;
+                    if count == 100 {println!("UDP: average (over 100 reads longer than 100 bytes) is {} bytes", acc/count); count = 0;}
+                    println!("UDP: {} bytes", tuple.0);
+                }
                 handle_udp_request(s, tuple.1, &mut udp, &connections);
             }
             _ => {
